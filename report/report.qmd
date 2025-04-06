@@ -1,0 +1,898 @@
+---
+title: Homework 8 - World Bank Analysis
+author:
+    - name: Alexa Lauer
+      email: lauera@vcu.edu
+date: last-modified
+format:
+    html:
+        theme: cosmo
+        toc: false
+        embed-resources: true
+        code-copy: true
+execute:
+  echo: true
+  eval: true
+  cache: false
+---
+
+In this assignment, we explored various SQL techniques to analyze data from the World Development Indicators (WDI) dataset, focusing on countries categorized by regions and income groups as defined by the World Bank. This exercise demonstrated how data transformation and querying can yield actionable insights, aligning with the World Bank’s mission to provide data-driven solutions for global development challenges.
+
+
+GITHUB URL:  https://github.com/cmsc-vcu/cmsc408-fa2024-hw8-alexalauer
+
+
+# Problem Background
+
+The World Bank, an international financial institution, works to reduce poverty and promote economic development in low and middle-income countries through financial aid, technical expertise, and research. Central to this mission is the World Development Indicators (WDI) database, which provides comprehensive economic and social statistics, such as GDP, education, health, and poverty metrics. For this assignment, I will analyze WDI data to uncover key insights about global development trends.
+
+```{python}
+#| echo: false
+import os
+import re
+import sys
+import copy
+import pandas as pd
+from tabulate import tabulate
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ArgumentError, NoSuchModuleError, OperationalError, ProgrammingError
+
+def run_sql_and_return_df(cnx,sql):
+    """Given an SQL command and connection string, return a DataFrame."""
+
+    # Check if the connection is None
+    if cnx is None:
+        error_message = "No valid connection. See above."
+        df = pd.DataFrame({'ErrorType': ['ConnectionError'], 'ErrorMessage': [error_message]})
+        return df.to_html(index=False)
+
+    try:
+        df = pd.read_sql(sql, cnx)
+        if df.empty:
+            # Create a single-row DataFrame with all columns as None
+            df = pd.DataFrame([["no records returned"]+ [''] * (len(df.columns) - 1) ], columns=df.columns)
+
+        # Convert the DataFrame to HTML and use custom styling to span columns if needed
+        html_output = df.to_html(index=False, na_rep="", justify="center")
+        html_output = re.sub(r'(?<=>)None(?=<)', 'NULL', html_output)
+
+        # Add colspan attribute to span columns if rendering in an environment that supports it
+        html_output = html_output.replace('<td>no records found</td>', f'<td colspan="{len(df.columns)}">no records found</td>')
+
+        # Append a row at the bottom with row and column count information
+        if len(df)>0:
+            row_count = len(df)
+            col_count = len(df.columns)
+            count_row = f'<tr><td colspan="{col_count}" style="text-align: left;">Total Rows: {row_count}, Total Columns: {col_count}</td></tr>'
+            html_output = html_output.replace('</tbody>', f'{count_row}</tbody>')
+
+        return html_output
+
+    except OperationalError as e:
+        # Catch connection or database errors
+        error_message = f"Operational Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['OperationalError'], 'ErrorMessage': [error_message]})
+    except ProgrammingError as e:
+        # Catch SQL syntax errors or issues with the command
+        error_message = f"Programming Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['ProgrammingError'], 'ErrorMessage': [error_message]})
+    except mysql.connector.Error as e:
+        # Catch MySQL-specific errors
+        error_message = f"MySQL Connector Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['MySQL Connector Error'], 'ErrorMessage': [error_message]})
+    except Exception as e:
+        # Catch all other exceptions
+        error_message = f"Unknown Error: {str(e)}"
+        df = pd.DataFrame({'ErrorType': ['UnknownError'], 'ErrorMessage': [error_message]})
+    
+    return df.to_html(index=False)
+
+def create_database_engine(uri):
+    """Create an SQLAlchemy engine with error handling and test the connection."""
+
+    try:
+        # Attempt to create the engine
+        engine = create_engine(uri)
+
+        # Test the connection with a lightweight query
+
+        run_sql_and_return_df(engine,"select 1 from dual")
+
+#        with engine.connect() as connection:
+#            connection.execute(text("SELECT 1"))
+        
+        return engine  # Return the engine if connection test is successful
+
+    except ArgumentError as e:
+        error_message = f"URI Error: {e}"
+    except NoSuchModuleError as e:
+        error_message = f"Database driver not found: {e}"
+    except OperationalError as e:
+        error_message = f"Operational error: {e}"
+    except Exception as e:
+        error_message = f"An unexpected error occurred: {e}"
+    
+    return None  # Return None if any error occurs
+
+def execute_ddl(cnx,ddl_commands):
+    """
+    Executes DDL statements from a file on a given SQLAlchemy connection, 
+    capturing any errors and results.
+    """
+    messages = []
+    errors = []
+
+    # Check if the connection is None
+    if cnx is None:
+        error_message = "No valid connection. See above."
+        df = pd.DataFrame({'ErrorType': ['ConnectionError'], 'ErrorMessage': [error_message]})
+        return df.to_html(index=False)
+
+    # Split commands if needed, such as if commands are separated by semicolons
+    ddl_statements = [cmd.strip() for cmd in ddl_commands.split(';') if cmd.strip()]
+
+    with cnx.connect() as connection:
+        for statement in ddl_statements:
+            try:
+                result = connection.execute(text(statement))
+                # Capture the result, if any
+                result_info = result.rowcount if result.rowcount != -1 else "No rows affected"
+                messages.append(f"Executed statement: {statement}<br/>Result: {result_info}<br/>")
+            except Exception as e:
+                # Capture the error message if execution fails
+                errors.append(f"<hr/>Error executing statement: <b>{statement}</b><br/>    Error: {str(e)}<br/>")
+
+#    return messages, errors
+
+    if errors:
+        df = pd.DataFrame({'Errors': errors})
+        return df.to_html(index=False)
+
+    return None
+
+```
+
+## Verify access to the world bank data
+
+```{python}
+#| echo: false
+#| output: asis
+
+# modify config_map to reflect credentials needed by this program
+# These variables are set in your .env file
+config_map = {
+    'user':'CMSC408_USER',
+    'password':'CMSC408_PASSWORD',
+    'host':'CMSC408_HOST',
+    'database':'HW8_DB_NAME'
+}
+# load and store credentials
+load_dotenv()
+config = {}
+for key in config_map.keys():
+    config[key] = os.getenv(config_map[key])
+
+errors = []
+for param in config.keys():
+    if config[param] is None:
+        flag = True
+        errors.append(f"Missing {config_map[param]} in .env file.")
+
+cnx = None
+error_df=""
+if errors:
+    errors.append("All subsequent SQL commands will fail.")
+    errors.append("Fix the .env file and rerun quarto ...")
+    # Convert errors to a DataFrame
+    error_df = pd.DataFrame({'Errors loading .env file': errors})
+    error_df
+else:
+# build a sqlalchemy engine string
+    engine_uri = f"mysql+pymysql://{config['user']}:{config['password']}@{config['host']}/{config['database']}"
+
+    # create and test the database connection.
+    cnx = create_database_engine( engine_uri )
+
+```
+
+We'll be using the following database connection attributes.  The password has been sanitized.
+
+```{python}
+#| echo: false
+clean_config = copy.deepcopy(config)
+clean_config['password'] = '...'
+clean_config
+```
+
+You should see 3 tables in the list below.  These are tables that live inside
+the instructors table schema *world_bank_data*.  You've been
+granted access to these tables, and will eventually make copies for yourself.  Refer to the
+<../source_data/loader.html> file for more information.
+
+
+```{python}
+# Do a quick test of the connection and trap the errors better!
+
+run_sql_and_return_df(cnx,"""
+select
+  table_schema, table_name, table_rows
+from
+  information_schema.tables
+where
+  table_schema in ('world_bank_data')
+""")
+
+```
+
+# Exercises
+
+In the following exercises, write the SQL as requested to discover the answer.
+
+## Task 1
+
+How many records are in the country table?
+
+```{python}
+# How many records are in the world_bank_data.wdi_country table?
+# (skills: select, aggregate)
+
+run_sql_and_return_df(cnx,"""
+select
+  count(*) as "Row Count"
+from
+  world_bank_data.wdi_country
+""")
+
+```
+
+## Task 2
+
+Explore the first 5 records in the country table.
+
+```{python}
+## write out the first 10 records and look at the columns
+## Do you see any blanks or missing data?
+## (skills: select, limit)
+
+run_sql_and_return_df(cnx,"""
+select
+  *
+from 
+  world_bank_data.wdi_country
+limit 5
+""")        
+
+```
+
+
+## Task 3
+
+List all non-countries.
+
+```{python}
+## task 3
+## Which records are NOT for countries, that is they're for regions or groups of countries.
+## How can you tell?
+## Once you figure it out, write a query to list all the non-countries
+## (skills: select, where)
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Table Name`
+from 
+    world_bank_data.wdi_country
+where
+    Region IS NULL
+""")
+
+```
+
+## Task 4
+
+Create your own copy of WDI_Country containing just countries.
+
+```{python}
+## task 4
+## The WDI table clearly contains information for countries and non-countries
+## using CREATE TABLE ... SELECT from WHERE syntax.
+## Finally, below write a query to return the number
+## of records in the new table.
+## (skills: select, aggregate)
+
+# drop table
+execute_ddl(cnx,"""
+drop table if exists wdi_country;
+""")
+```
+
+```{python}
+# create table
+execute_ddl(cnx,"""
+create table wdi_country as 
+select * from world_bank_data.wdi_country
+where not region is NULL
+""")
+```
+
+```{python}
+# show number of records
+run_sql_and_return_df(cnx,"""
+select count(*) from wdi_country
+""")
+```
+
+## Task 5
+
+```{python}
+## create local wdi data table using world_bank_data.wdi_data
+## (skills: create table)
+
+# drop table
+execute_ddl(cnx,"""
+drop table if exists wdi_data;
+""")
+```
+```{python}
+#execute_ddl(cnx,"""
+#create table wdi_data as
+#select * from world_bank_data.wdi_data
+#""")
+```
+```{python}
+run_sql_and_return_df(cnx,"""
+show tables;
+""")
+```
+
+## Task 6
+
+```{python}
+## create local table of series table using world_bank_data.wdi_series
+## The series table contains information
+## about the data that you're using.
+## (skills: create table)
+
+# drop table
+execute_ddl(cnx,"""
+drop table if exists wdi_series;
+""")
+```
+```{python}
+execute_ddl(cnx,"""
+create table wdi_series as
+select * from world_bank_data.wdi_series
+""")
+```
+```{python}
+run_sql_and_return_df(cnx,"""
+show tables;
+""")
+```
+
+
+## Task 7
+
+According to the World Bank, in 2020 there were how many countries in the world?
+
+```{python}
+## (skills: select, aggregate)
+
+run_sql_and_return_df(cnx,"""
+select 
+    count(`Country Code`) AS country_count 
+FROM 
+    wdi_country
+""")
+```
+
+
+## Task 8
+
+
+```{python}
+## How many records are in your local WDI_DATA table?
+## (skills: select, aggregate)
+
+run_sql_and_return_df(cnx,"""
+select 
+    count(*) as total_records
+FROM 
+    wdi_data;
+""")
+```
+
+## Task 9
+
+```{python}
+## How many records are in your local WDI_SERIES table?
+## (skills: select, aggregate)
+
+run_sql_and_return_df(cnx,"""
+select 
+    count(*) as total_records
+FROM 
+    wdi_series;
+""")
+```
+
+
+## Task 10
+
+What are all unique values of region in the wdi_country table?
+
+```{python}
+## Let's investigate the country_region field.
+## What is the domain of the country_region field? That is,
+## what are the unique values found there?
+## (there are several possible ways to code this in SQL)
+## (skills: select, aggregate, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    DISTINCT Region
+FROM 
+    wdi_country;
+""")
+
+```
+
+## Task 11
+
+```{python}
+## How many countries are in each region?
+## (skills: select, aggregate, group by, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    Region,
+    count(DISTINCT `Country Code`) AS country_count
+FROM 
+    wdi_country
+GROUP BY 
+    Region;
+""")
+
+```
+
+## Task 12
+
+```{python}
+## List the country full names and regions for all countries in north america
+## (skills: select, where, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Long Name`, 
+    Region 
+FROM 
+    wdi_country
+WHERE
+    Region = 'North America';
+""")
+
+```
+
+## Task 13
+
+```{python}
+## The last World Cup soccer tournament was hosted by Qatar.
+## What region contains Qatar?  List the region, country short name and full name
+## (skills: select, where)
+
+run_sql_and_return_df(cnx,"""
+select 
+    Region, 
+    `Short Name`,
+    `Long Name`
+FROM
+    wdi_country
+WHERE 
+    `Short Name` = 'Qatar';
+""")
+
+```
+
+## Task 14
+
+```{python}
+## There are two abbreviation fields in the data country_abbr and country_wb_abbr.
+## List the country code, short name, abbr, wb_abbr and region for all the countries
+## where the abbr and wb_abbr are different.
+## (skills: select, where, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Country Code`,
+    `Short Name`, 
+    `2-alpha code`, 
+    `WB-2 code`,
+    Region
+FROM 
+    wdi_country
+WHERE 
+    `2-alpha code` != `WB-2 code`;
+""")
+
+```
+
+## Task 15
+
+```{python}
+## Now, let's investigate the "income category" field.
+## List the income categories and the number of countries in each
+## income category in descending order of most countries to least.
+## (skills: select, aggregate, group by, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Income Group`,
+    count(*) AS country_count
+FROM   
+    wdi_country
+GROUP BY
+    `Income Group`
+ORDER BY
+    country_count DESC;
+""")
+```
+
+## Task 16
+
+```{python}
+## Mystery task.  Looking at the table from Task 15, write the
+## next obvious query based on the results in the table.
+## At a minimum, your query should put country short name in the first column.
+## you will be scored on the number of records returned and the value(s) 
+## in the first column.
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Short Name`,
+    `Income Group`,
+    `Country Code`
+FROM 
+    wdi_country
+Where 
+    `Income Group` IS NULL;
+""")
+
+```
+
+## Task 17
+
+```{python}
+## OK, this HAS to be an error. Let's make a assumption that the country 
+## in question, because they are oil-rich, are "high income".  
+## Write an update comment to correct the issue.
+## NOTE - if you get this wrong, all subsequent tables will be wrong!
+
+execute_ddl(cnx,"""
+UPDATE
+    wdi_country
+SET 
+    `Income Group` = 'High Income'
+WHERE 
+    `Income Group` IS NULL;
+COMMIT;
+""")
+
+
+```
+```{python}
+## Now, display the country again to verify the change stuck!
+
+run_sql_and_return_df(cnx,"""
+select 
+    `Short Name`,
+    `Income Group`,
+    `Country Code`
+FROM 
+    wdi_country
+WHERE 
+    `Short Name` = 'Venezuela'
+""")
+```
+
+## Task 18
+
+```{python}
+## Write a single query that show the number of countries in each 
+## "Region"-"Income Group" pair.  The table should have 3 columns:
+## region, income group, and no.of.countries.
+## (skills: select, aggregate, group by, order by)
+
+run_sql_and_return_df(cnx,"""
+select 
+    Region, 
+    `Income Group`,
+    count(*) AS `no_of_countries`
+FROM 
+    wdi_country
+GROUP BY
+    Region, `Income Group`
+ORDER BY
+    `no_of_countries` DESC;
+""")
+
+```
+
+## Task 19
+
+```{python}
+## Examine the result from task 18. It would be really cool to
+## present the results of this table in a 2-D form, with 
+## columns for each income category (high, upper middle, lower middle, low, other)
+## regions down the side, and the pair-wise count inside each cell.
+## Using CASE statements, DO IT!  BE SURE to include the countries without
+## an income category.
+
+## HINT - your query should return 6 columns: the region name, one
+## column for each of the income categories (e.g., High, Upper middle, etc.)
+## and a column for the row totals.
+## (skills: select, aggregate, group by, nested query)
+
+run_sql_and_return_df(cnx,"""
+select 
+    Region,
+    COUNT(CASE WHEN `Income Group` = 'High income' THEN 1 END) * 1.0 AS `High`,
+    COUNT(CASE WHEN `Income Group` = 'Upper middle income' THEN 1 END) * 1.0 AS `Upper middle`,
+    COUNT(CASE WHEN `Income Group` = 'Lower middle income' THEN 1 END) * 1.0 AS `Lower middle`,
+    COUNT(CASE WHEN `Income Group` = 'Low income' THEN 1 END) * 1.0 AS `Low`,
+    COUNT(*) * 1.0 AS `Total`
+FROM 
+    wdi_country
+GROUP BY 
+    Region
+ORDER BY 
+    Region;
+""")
+
+```
+
+## Task 20
+
+```{python}
+## Wow! what a cool table!  It is very interesting to see where the money
+## sits around the world.  Using the general approach from Task 18 above
+## and write a query to return the single region with the most lower-income
+## countries.
+
+## Your query should return 2 columns, the region name and the number of 
+## low-income countries
+
+## PUT THE NUMBER FIRST!
+## (skills: select, aggregate, group by, nested query, order by, limit)
+
+run_sql_and_return_df(cnx,"""
+select 
+    count(*) AS `no_of_low_income`,
+    Region,
+    `Income Group`
+FROM 
+    wdi_country
+WHERE 
+    `Income Group` = 'Low Income'
+GROUP BY 
+    Region
+ORDER BY 
+    `no_of_low_income` DESC
+LIMIT 1;
+"""
+)
+```
+
+## Task 21
+
+```{python}
+## Are you getting the hand of this? Good! We need to take a look at all
+## the countries in the same region and with the same income category as
+## the Marshall Islands.
+## For each country that matches, print their country code, short name,
+## region and income category, by order of their short name.  As a hint,
+## the country code for the Marshall Islands is MHL.
+## (skills: select, where, subquery)
+
+run_sql_and_return_df(cnx,"""
+SELECT 
+    `Country Code`, 
+    `Short Name`, 
+    Region, 
+    `Income Group`
+FROM 
+    wdi_country
+WHERE 
+    Region = (SELECT Region FROM wdi_country WHERE `Country Code` = 'MHL') 
+    AND `Income Group` = (SELECT `Income Group` FROM wdi_country WHERE `Country Code` = 'MHL')
+ORDER BY 
+    `Short Name`;
+
+""")
+
+```
+
+## Task 22
+
+```{python}
+## OK - let's raise the heat in the kitchen! Review the output from task 18.
+## You'll see that some of the regions do not contain all of the income
+## levels.  For example, the Europe & Central Asia region does not have
+## any low income countries.
+##
+## CHALLENGE - using a SINGLE SQL statement, write a table that contains every
+## combination of region and income category (including the missing '') values!
+##
+## THEN add a WHERE clause to only show the values that were missing from
+## the original pairings!
+##
+## HINT - there should be AT MOST [# of regions]x[# of income cats] = 28
+## rows in your final table, and there are 22 rows returned in the query
+## in Task 18.  (FYI - I get 6 rows in my final table.)
+## (skills: select, where, subqueries, joins)
+
+run_sql_and_return_df(cnx,"""
+SELECT 
+    r.Region, 
+    ic.`Income Group`, 
+    COUNT(c.`Country Code`) AS `no_of_countries`
+FROM 
+    (SELECT DISTINCT Region FROM wdi_country) r
+CROSS JOIN 
+    (SELECT 'High income' AS `Income Group` UNION
+     SELECT 'Upper middle income' UNION
+     SELECT 'Lower middle income' UNION
+     SELECT 'Low income') ic
+LEFT JOIN 
+    wdi_country c
+    ON c.Region = r.Region AND c.`Income Group` = ic.`Income Group`
+GROUP BY 
+    r.Region, ic.`Income Group`
+HAVING 
+    `no_of_countries` = 0
+ORDER BY 
+    r.Region, ic.`Income Group`;
+
+""")
+
+```
+
+## Task 23
+
+```{python}
+## Hot enough, yet?  Let's go for ghost-pepper HOT!  Now let's build some
+## percentage tables.  For example, across the entire sample, what
+## is the percentage of total countries in each income category?
+##
+## As a first step, build off the result from task 18 and create a table with
+## six columns (region, income cat, country count, sum of countries in region,
+## sum of countries by income and total sum countries).
+##
+## THEN, add a 7th column calculating the percent of total for each,
+## region-income pair.
+##
+## actually calculating percentages and print out a table will be a
+## slam dunk after this!
+## (skills: select, where, subqueries, joins, aggregate functions)
+
+run_sql_and_return_df(cnx,"""
+SELECT 
+    c.Region,
+    c.`Income Group`,
+    COUNT(c.`Country Code`) AS `Country Count`,
+    SUM(COUNT(c.`Country Code`)) OVER (PARTITION BY c.Region) AS `Sum in Region`,
+    SUM(COUNT(c.`Country Code`)) OVER (PARTITION BY c.`Income Group`) AS `Sum by Income Group`,
+    (SELECT COUNT(*) FROM wdi_country) AS `Total Sum Countries`,
+    ROUND((COUNT(c.`Country Code`) * 100.0) / (SELECT COUNT(*) FROM wdi_country), 1) AS `Percentage of Total`
+FROM 
+    wdi_country c
+GROUP BY 
+    c.Region, c.`Income Group`
+HAVING 
+    COUNT(c.`Country Code`) > 0
+ORDER BY 
+    c.Region, c.`Income Group`;
+
+"""
+)
+
+
+```
+
+## Task 24
+
+```{python}
+## SLAM DUNK TIME!  Using the resulting table CTEs from Task 23,
+## print table similar to the table in Task 19, with Income group in the
+## columns, Region in the rows and Percent of total in each cell of the table.
+
+run_sql_and_return_df(cnx,"""
+WITH RegionIncomeCounts AS (
+    SELECT 
+        Region, 
+        `Income Group`, 
+        COUNT(`Country Code`) AS CountryCount,
+        (SELECT COUNT(*) FROM wdi_country) AS TotalCountries
+    FROM 
+        wdi_country
+    GROUP BY 
+        Region, `Income Group`
+)
+SELECT 
+    Region,
+    ROUND(SUM(CASE WHEN `Income Group` = 'High income' THEN (100.0 * CountryCount / TotalCountries) ELSE 0 END), 1) AS `High Income`,
+    ROUND(SUM(CASE WHEN `Income Group` = 'Upper middle income' THEN (100.0 * CountryCount / TotalCountries) ELSE 0 END), 1) AS `Upper Middle Income`,
+    ROUND(SUM(CASE WHEN `Income Group` = 'Lower middle income' THEN (100.0 * CountryCount / TotalCountries) ELSE 0 END), 1) AS `Lower Middle Income`,
+    ROUND(SUM(CASE WHEN `Income Group` = 'Low income' THEN (100.0 * CountryCount / TotalCountries) ELSE 0 END), 1) AS `Low Income`,
+    ROUND(SUM(100.0 * CountryCount / TotalCountries), 1) AS `Row Total`
+FROM 
+    RegionIncomeCounts
+GROUP BY 
+    Region
+ORDER BY 
+    Region;
+""")
+
+```
+
+## Task 25
+
+```{python}
+## ANOTHER DUNK!  Using the resulting table CTEs from Task 23,
+## print a table listing the number, totals and percentage of countries
+## by income category.
+
+## (This is much simpler than task 24!)
+
+run_sql_and_return_df(cnx,"""
+WITH IncomeCategoryCounts AS (
+    SELECT 
+        `Income Group`,
+        COUNT(`Country Code`) AS CountryCount
+    FROM 
+        wdi_country
+    GROUP BY 
+        `Income Group`
+),
+TotalCountries AS (
+    SELECT 
+        COUNT(`Country Code`) AS TotalCountries
+    FROM 
+        wdi_country
+)
+SELECT 
+    ic.`Income Group` AS `Income Category`,
+    ic.CountryCount AS `Number of Countries`,
+    tc.TotalCountries AS `Total Countries`,
+    ROUND((ic.CountryCount * 100.0) / tc.TotalCountries, 1) AS `Percentage of Total`
+FROM 
+    IncomeCategoryCounts ic
+CROSS JOIN 
+    TotalCountries tc
+ORDER BY 
+    ic.`Income Group`;
+""")
+
+```
+
+# Reflection
+
+1. Reflect on the SQL skills you used throughout these exercises. Which skills do you feel most confident in, and which do you think need more practice? How has this assignment helped you build or reinforce specific SQL competencies?
+
+Based on the skills I used in these tasks, I feel the most confident in the basic sql commands. I have used similar commands in R for other classes, but many of those did not go beyond simple selects, grouping and joins. I need more practice with nested queries, it can be diffciutlt for me to force all of the commands into only one sql command. The assignment helped me build my skills in stringing all the commands I need togther. Finding the right order to filter data can be difficult, but I think this assignment helped me develop my skill at this process. 
+
+1. Problem-Solving Approach: Describe your approach to tackling the more complex tasks (like Tasks 18, 23, and 24). How did you break down these problems, and what steps did you take when you encountered challenges? How would you approach a similar problem differently in the future?
+
+I always start with the from statement so I know where I need to get the data from. Then I move on to a basic setup for the select statement to asses which columns need to be included in the final table. Obviously these are the easy steps, but it is helpful to do them first to help get my bearings for the next steps. Next I add to the select statement (the sum statements or counts). Now I like to determine what data I need to include in my JOIN statements. Finally I add anything else to the select statement that I may have missed as well as any grouping or ordering I need. 
+
+1. Learning Takeaways: Consider the overall learning experience from this assignment. What were the biggest takeaways about working with SQL for data analysis and transformation? How do you think these skills will apply in real-world scenarios or future coursework?
+
+The biggest takeaways from this assignment are:
+
+Joins and Aggregations: Mastering JOIN and GROUP BY is critical for combining and summarizing data, as seen when identifying missing combinations and calculating totals.
+Handling Missing Data: Using techniques like LEFT JOIN and CROSS JOIN ensures complete datasets, which is essential in real-world data cleaning and analysis.
+Window Functions: SUM() OVER simplifies complex calculations like regional totals and percentages, making queries more efficient.
+Problem Framing: Understanding the data context and structuring queries to answer specific questions is key for actionable insights.
+Real-World Relevance: These skills apply to business intelligence, reporting, and data transformation across industries, preparing for future coursework or professional roles.
+
+This assignment highlighted how SQL is a powerful tool for solving practical data challenges efficiently.
+
